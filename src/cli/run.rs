@@ -1719,7 +1719,7 @@ impl Run {
             // Tasks without sources always run and should not trigger invalidation.
             if let Ok(outcome) = &result {
                 let mut deps = deps_for_remove.lock().await;
-                if outcome.did_work && !task.sources.is_empty() {
+                if outcome.did_work() && !task.sources.is_empty() {
                     deps.mark_did_work(&task);
                 }
                 if let Some(cache_key) = &outcome.cache_key {
@@ -2279,8 +2279,8 @@ fn history_status(
 ) -> (crate::task::task_history::RunStatus, Option<i32>) {
     use crate::task::task_history::RunStatus;
     match result {
-        Ok(outcome) if outcome.restored => (RunStatus::Cached, None),
-        Ok(outcome) if outcome.did_work => (RunStatus::Ok, Some(0)),
+        Ok(outcome) if outcome.state == crate::task::task_executor::TaskRunState::Restored => (RunStatus::Cached, None),
+        Ok(outcome) if outcome.did_work() => (RunStatus::Ok, Some(0)),
         Ok(_) => (RunStatus::Skipped, None),
         Err(_) if panicked => (RunStatus::Failed, Some(1)),
         Err(err) if cancelled => (RunStatus::Cancelled, Error::get_exit_status(err)),
@@ -2295,8 +2295,8 @@ fn report_status(
     cancelled: bool,
 ) -> (TaskReportStatus, Option<i32>) {
     match result {
-        Ok(outcome) if outcome.restored => (TaskReportStatus::Cached, None),
-        Ok(outcome) if !outcome.did_work => (TaskReportStatus::Skipped, None),
+        Ok(outcome) if outcome.state == crate::task::task_executor::TaskRunState::Restored => (TaskReportStatus::Cached, None),
+        Ok(outcome) if !outcome.did_work() => (TaskReportStatus::Skipped, None),
         Ok(_) => (TaskReportStatus::Passed, Some(0)),
         // Abandoned before it started: the run never reached it.
         Err(err) if Error::is_task_interrupted_before_start(err) => {

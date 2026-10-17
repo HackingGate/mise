@@ -139,17 +139,38 @@ still to come.
 
 ### Task span attributes
 
-| Attribute                | Value                                                                                                    |
-| ------------------------ | -------------------------------------------------------------------------------------------------------- |
-| `mise.task.name`         | The task name.                                                                                           |
-| `mise.task.display_name` | The task name plus its arguments, which is also the span name.                                           |
-| `mise.task.args`         | The arguments passed to the task, joined with spaces. Present only when there are arguments.             |
-| `mise.task.source`       | The path of the config file that defines the task.                                                       |
-| `mise.task.config_root`  | The config root of the task's config file.                                                               |
-| `mise.task.skipped`      | `true` when mise skipped the task because its sources were up to date.                                   |
-| `mise.task.cancelled`    | `true` when mise stopped the task because another task failed or the run was interrupted (Ctrl-C).       |
-| `process.command_args`   | The full argv as a string array (`["mise", task_name, ...args]`), per the OpenTelemetry CLI conventions. |
-| `process.exit.code`      | The task's exit code as an integer: `0` for success or a skipped task, otherwise the failed command's.   |
+| Attribute                 | Value                                                                                                                                                    |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mise.task.name`          | The task name.                                                                                                                                           |
+| `mise.task.display_name`  | The task name plus its arguments, which is also the span name.                                                                                           |
+| `mise.task.args`          | The arguments passed to the task, joined with spaces. Present only when there are arguments.                                                             |
+| `mise.task.source`        | The path of the config file that defines the task.                                                                                                       |
+| `mise.task.config_root`   | The config root of the task's config file.                                                                                                               |
+| `mise.task.skipped`       | `true` when mise skipped the task because its sources were up to date.                                                                                   |
+| `mise.task.cancelled`     | `true` when mise stopped the task because another task failed or the run was interrupted (Ctrl-C).                                                       |
+| `mise.task.restored`      | `true` when mise restored the task's outputs from the [artifact cache](#artifact-cache) instead of running it, `false` when the task ran or was skipped. |
+| `mise.task.cache.enabled` | `true` when mise computed an artifact cache key for the task.                                                                                            |
+| `mise.task.cache.key`     | The artifact cache key, the same one `mise run --dry-run --task-cache-explain-json` prints. Present only when the cache is enabled.                      |
+| `mise.task.cache.result`  | What the artifact cache did: `hit`, `fresh`, `miss`, `forced` or `disabled`. See [Artifact cache](#artifact-cache).                                      |
+| `process.command_args`    | The full argv as a string array (`["mise", task_name, ...args]`), per the OpenTelemetry CLI conventions.                                                 |
+| `process.exit.code`       | The task's exit code as an integer: `0` for success or a skipped task, otherwise the failed command's.                                                   |
+
+`mise.task.restored` and the `mise.task.cache.*` attributes are set on every
+task that completes. A task that fails has none of them.
+
+### Artifact cache
+
+A task restored from the [artifact cache](/tasks/caching.html)
+succeeds without running, so its exit code and status match a task that ran.
+`mise.task.restored` and `mise.task.cache.result` tell them apart:
+
+| `mise.task.cache.result` | Meaning                                                                                                                                                                          |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `hit`                    | mise restored the outputs from a cache entry. `mise.task.restored` is `true`.                                                                                                    |
+| `fresh`                  | The outputs in the working tree were already produced under this key, so nothing ran or was restored. `mise.task.skipped` is `true`.                                             |
+| `miss`                   | No usable cache entry existed, or it had expired or was corrupt, or a dependency finished without a cache key, so the task ran. mise prints the reason after `cache miss:`.      |
+| `forced`                 | `--force` ran the task without looking it up.                                                                                                                                    |
+| `disabled`               | mise did not look the task up: the task has no `cache`, `--task-cache` is `off` or `write-only`, the task receives secrets, it runs raw or interactive, or the run is a dry run. |
 
 ### Failed vs. cancelled tasks
 
