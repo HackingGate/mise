@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+
+# Task spans tell a task restored from the artifact cache apart from one that
+# ran, and carry the cache key and what the cache did.
+
+cat <<'EOF_SERVER' >collector.py
+import http.server
+import pathlib
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        signal = self.path.rsplit("/", 1)[-1]
+        with open(f"{signal}.jsonl", "ab") as f:
+            f.write(body.replace(b"\n", b"") + b"\n")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+    def log_message(self, *_args):
+        pass
+
+
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+pathlib.Path("collector.port").write_text(str(server.server_port), encoding="utf-8")
+server.serve_forever()
+EOF_SERVER
+
+# Prints one line per task span: "<name> <attr>=<value> ...", with the cache key
+# replaced by "key" so the lines are stable. Reads and then removes the export.
+cat <<'EOF_SUMMARY' >summary.py
+import json
+import pathlib
+
+keys = [
+    "mise.task.skipped",
+    "mise.task.restored",
+    "mise.task.cache.enabled",
+    "mise.task.cache.key",
+    "mise.task.cache.result",
+]
+path = pathlib.Path("traces.jsonl")
+spans = [
+    span
+    for line in path.read_text().splitlines()
+    for rs in json.loads(line).get("resourceSpans", [])
+    for ss in rs.get("scopeSpans", [])
+    for span in ss.get("spans", [])
+]
+path.unlink()
+for s in spans:
+    attrs = {kv["key"]: next(iter(kv["value"].values())) for kv in s.get("attributes", [])}
+    if "mise.task.name" not in attrs:
+        continue
+    out = [s["name"]]
+    for k in keys:
+        if k in attrs:
+            v = attrs[k]
+            if k == "mise.task.cache.key":
+                v = "key" if len(v) == 64 else v
+            out.append(f"{k.removeprefix('mise.task.')}={json.dumps(v)}")
+    print(" ".join(out))
+EOF_SUMMARY
+
+python3 collector.py &
+collector_pid=$!
+trap 'kill "$collector_pid" 2>/dev/null || true' EXIT
+wait_for_file collector.port "OTLP collector port" 30 "$collector_pid"
+
+port="$(cat collector.port)"
+export OTEL_EXPORTER_OTLP_ENDPOINT="http://127.0.0.1:$port"
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/json
+export MISE_OTEL_ENABLED=1
+
+cat <<'EOF' >mise.toml
+[settings]
+experimental = true
+
+[tasks.build]
+run = "cat input.txt > out.txt"
+sources = ["input.txt"]
+outputs = ["out.txt"]
+cache = { enabled = true }
+
+[tasks.plain]
+run = "echo plain"
+EOF
+echo one >input.txt
+
+mise run build
+assert "python3 summary.py" 'build restored=false cache.enabled=true cache.key="key" cache.result="miss"'
+
+mise run build
+assert "python3 summary.py" 'build skipped=true restored=false cache.enabled=true cache.key="key" cache.result="fresh"'
+
+# Deleting the output makes the next run restore it instead of running.
+rm out.txt
+mise run build
+assert "cat out.txt" "one"
+assert "python3 summary.py" 'build restored=true cache.enabled=true cache.key="key" cache.result="hit"'
+
+mise run --force build
+assert "python3 summary.py" 'build restored=false cache.enabled=true cache.key="key" cache.result="forced"'
+
+mise run --task-cache off build
+assert "python3 summary.py" 'build skipped=true restored=false cache.enabled=false cache.result="disabled"'
+
+mise run plain
+assert "python3 summary.py" 'plain restored=false cache.enabled=false cache.result="disabled"'
