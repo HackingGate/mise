@@ -82,6 +82,9 @@ pub struct TaskRunContext<'a> {
     pub covered: Cover,
     /// Set once the task's env has been resolved and its secrets registered for redaction.
     pub env_resolved: Option<Arc<AtomicBool>>,
+    /// Receives the task's cache decision once it is made, so it is known even when the
+    /// task then fails.
+    pub cache_decision: &'a std::sync::OnceLock<TaskCacheDecision>,
 }
 
 #[derive(Clone, Copy)]
@@ -453,6 +456,8 @@ pub struct TaskExecutor {
     pub output_forwarder: Option<crate::otel::TaskOutputForwarder>,
     /// What `mise run --report-file` writes; tasks a `run` entry injects are listed in it.
     pub run_report: Option<Arc<crate::task::run_report::RunReport>>,
+    /// The run-result file, which every task is told about so a nested run appends to it.
+    pub result_file: Option<Arc<crate::task::task_result_file::TaskResultFile>>,
 }
 
 /// What happened to a task that completed without an error.
@@ -584,6 +589,7 @@ impl TaskExecutor {
             cli_secrets: config.cli_secrets,
             output_forwarder: None,
             run_report: None,
+            result_file: None,
         }
     }
 
@@ -780,6 +786,7 @@ impl TaskExecutor {
             injected,
             covered,
             env_resolved,
+            cache_decision: cache_decision_slot,
         } = ctx;
         // Every task reaches this point before it runs, whether it was named, a dependency, or
         // the rendered name of a `run` entry, so this is where a run that must not execute
@@ -1108,6 +1115,9 @@ impl TaskExecutor {
         } else {
             None
         };
+        if let Some(decision) = &cache_decision {
+            let _ = cache_decision_slot.set(decision.clone());
+        }
         let output_capture = artifact_cache
             .as_ref()
             .filter(|_| self.task_cache.writes())
@@ -3228,6 +3238,16 @@ impl TaskExecutor {
                     &mut env,
                     &mut nested_mise_diff_exclude_keys,
                     &key,
+                    value,
+                );
+            }
+        }
+        if let Some(result_file) = &self.result_file {
+            for (key, value) in result_file.task_env() {
+                Self::insert_env_excluded_from_nested_mise_diff(
+                    &mut env,
+                    &mut nested_mise_diff_exclude_keys,
+                    key,
                     value,
                 );
             }

@@ -97,6 +97,7 @@
 - [Workspace project graph (experimental)](https://mise.jdx.dev/tasks/workspace-graph.html): mise can read Cargo, uv, Go, Gradle, and Node.js workspace manifests to learn which projects a monorepo contains and how they depend on each other.
 - [Project dependencies (experimental)](https://mise.jdx.dev/dev-tools/deps.html): mise deps installs a project's packages, such as node_modules or a Python virtual environment, by running the package manager's install command when the files it tracks change or its outputs go…
 - [OpenTelemetry (experimental)](https://mise.jdx.dev/tasks/opentelemetry.html): mise can export a trace of each mise run to any backend that accepts OTLP over HTTP, such as Jaeger, Grafana Tempo, or SigNoz.
+- [Run results (experimental)](https://mise.jdx.dev/tasks/run-results.html): The task.result_file setting makes mise run write a record of what it did to a local file: which tasks executed, which were restored from the artifact cache, which were skipped, failed, cancelled or…
 - [Task configuration reference](https://mise.jdx.dev/tasks/task-configuration.html): Find every property a task accepts, the [task_config] options that set defaults for a config root, the environment variables mise gives each task, and the settings that change how tasks run.
 
 ## Daemons (experimental)

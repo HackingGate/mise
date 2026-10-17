@@ -3130,6 +3130,7 @@ impl Bootstrap {
             executor: None,
             telemetry: None,
             task_history: None,
+            result_file: None,
             secrets_denied: Some(crate::secrets::SecretsDenied::Bootstrap),
             cli_secrets: None,
             secrets: vec![],
