@@ -474,6 +474,10 @@ the run time recorded when each restored entry was created. A task skipped by
 the freshness check does no lookup, so a run where every task was up to date
 prints `Task cache: no lookups`.
 
+To see what each task did, export the run's traces: every task span carries
+`mise.task.restored`, `mise.task.cache.key` and `mise.task.cache.result`
+(see [OpenTelemetry](/tasks/opentelemetry.html#artifact-cache)).
+
 ### List and clear entries
 
 [`mise cache task <task>`](/cli/cache/task.html) lists every local entry for a
