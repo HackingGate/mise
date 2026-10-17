@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+
+# `task.result_file` records what each task of a run did, and ends with a
+# completed record only when the run finished.
+
+# Prints one line per record: "run", "end <exit code>", or
+# "<task> <state> <exit code> <cache result>" plus "key" when a cache key is
+# present. Checks that every record of an invocation carries its id and that a
+# nested run names its parent.
+cat <<'EOF_SUMMARY' >summary.py
+import json
+import sys
+
+records = [json.loads(line) for line in open(sys.argv[1] if len(sys.argv) > 1 else "results.jsonl")]
+runs = {}
+for r in records:
+    if r["type"] == "run":
+        assert r["schema_version"] == 1, r
+        runs[r["invocation_id"]] = r["parent_invocation_id"]
+        parent = r["parent_invocation_id"]
+        assert parent is None or parent in runs, r
+        print("run" if parent is None else "nested run")
+    elif r["type"] == "end":
+        assert r["invocation_id"] in runs, r
+        assert r["completed"] is True, r
+        print(f"end {r['exit_code']}")
+    else:
+        assert r["invocation_id"] in runs, r
+        cache = r["cache"]
+        line = [r["name"], r["state"], str(r["exit_code"])]
+        if cache is not None:
+            line.append(cache["result"])
+            if cache["key"] is not None:
+                assert len(cache["key"]) == 64, cache
+                line.append("key")
+        if r["start_unix_ns"] is not None:
+            assert r["end_unix_ns"] - r["start_unix_ns"] == r["duration_ns"], r
+        print(" ".join(line))
+EOF_SUMMARY
+
+cat <<'EOF' >mise.toml
+[settings]
+experimental = true
+
+[tasks.build]
+run = "cat input.txt > out.txt"
+sources = ["input.txt"]
+outputs = ["out.txt"]
+cache = { enabled = true }
+
+[tasks.plain]
+run = "echo plain"
+
+[tasks.fail]
+run = "sleep 1; exit 3"
+
+[tasks.slow]
+run = "echo $$ > slow.pid; exec sleep 30"
+
+[tasks.fail-fast]
+depends = ["fail", "slow"]
+
+[tasks.after-fail]
+depends = ["fail"]
+run = "echo never"
+
+[tasks.nested]
+run = "mise run plain"
+EOF
+echo one >input.txt
+export MISE_TASK_RESULT_FILE=results.jsonl
+
+mise run build
+assert "python3 summary.py" "run
+build executed 0 miss key
+end 0"
+
+mise run build
+assert "python3 summary.py" "run
+build skipped None fresh key
+end 0"
+
+rm out.txt
+mise run build
+assert "cat out.txt" "one"
+assert "python3 summary.py" "run
+build restored 0 hit key
+end 0"
+
+mise run --force build
+assert "python3 summary.py" "run
+build executed 0 forced key
+end 0"
+
+mise run --task-cache off build ::: plain
+assert_contains "python3 summary.py" "build skipped None disabled"
+assert_contains "python3 summary.py" "plain executed 0 disabled"
+
+# A task that never started because its dependency failed is reported as not run.
+assert_fail "mise run after-fail"
+assert "python3 summary.py" "run
+fail failed 3 disabled
+after-fail not_run None
+end 3"
+
+# The sibling stopped by the failure is cancelled; the parent never ran.
+assert_fail "mise run fail-fast"
+assert "python3 summary.py" "run
+fail failed 3 disabled
+slow cancelled None
+fail-fast not_run None
+end 3"
+
+# A nested run appends its own records under the invocation that started it.
+mise run nested
+assert "python3 summary.py" "run
+nested run
+plain executed 0 disabled
+end 0
+nested executed 0 disabled
+end 0"
+assert "python3 -c 'import json; print(len({json.loads(l)[\"invocation_id\"] for l in open(\"results.jsonl\")}))'" "2"
+
+# A run that is killed never writes its end record.
+mise run slow &
+mise_pid=$!
+for _ in $(seq 1 100); do
+	grep -q '"type":"run"' results.jsonl 2>/dev/null && break
+	sleep 0.1
+done
+sleep 1
+kill -9 "$mise_pid"
+wait "$mise_pid" || true
+kill "$(cat slow.pid)" 2>/dev/null || true
+assert "python3 summary.py" "run"
+assert_fail "grep -q '\"type\":\"end\"' results.jsonl"
+
+# A dry run writes no file.
+rm results.jsonl
+mise run --dry-run plain
+assert_fail "test -e results.jsonl"
+
+# Without the setting no file is written.
+unset MISE_TASK_RESULT_FILE
+mise run plain
+assert_fail "test -e results.jsonl"

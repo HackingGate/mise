@@ -73,6 +73,9 @@ pub struct TaskRunContext<'a> {
     pub otel_span_cx: Option<opentelemetry::trace::SpanContext>,
     /// A task another task's run entry started. It never receives a command-line grant.
     pub injected: bool,
+    /// Receives the task's cache decision once it is made, so it is known even when the
+    /// task then fails.
+    pub cache_decision: &'a std::sync::OnceLock<TaskCacheDecision>,
 }
 
 #[derive(Clone, Copy)]
@@ -414,6 +417,8 @@ pub struct TaskExecutor {
     cli_secrets: Option<crate::secrets::CliSecretGrant>,
     /// Forwards task stdout/stderr to the OTEL log pipeline (when enabled).
     pub output_forwarder: Option<crate::otel::TaskOutputForwarder>,
+    /// The run-result file, which every task is told about so a nested run appends to it.
+    pub result_file: Option<Arc<crate::task::task_result_file::TaskResultFile>>,
 }
 
 /// What happened to a task that completed without an error.
@@ -543,6 +548,7 @@ impl TaskExecutor {
             secrets_denied: Self::secrets_denied_from(config.secrets_denied),
             cli_secrets: config.cli_secrets,
             output_forwarder: None,
+            result_file: None,
         }
     }
 
@@ -697,6 +703,7 @@ impl TaskExecutor {
             allow_during_interruption,
             otel_span_cx,
             injected,
+            cache_decision: cache_decision_slot,
         } = ctx;
         let prefix = task.estyled_prefix();
         let total_start = std::time::Instant::now();
@@ -999,6 +1006,9 @@ impl TaskExecutor {
         } else {
             None
         };
+        if let Some(decision) = &cache_decision {
+            let _ = cache_decision_slot.set(decision.clone());
+        }
         let output_capture = artifact_cache
             .as_ref()
             .filter(|_| self.task_cache.writes())
@@ -2900,6 +2910,16 @@ impl TaskExecutor {
                     &mut env,
                     &mut nested_mise_diff_exclude_keys,
                     &key,
+                    value,
+                );
+            }
+        }
+        if let Some(result_file) = &self.result_file {
+            for (key, value) in result_file.task_env() {
+                Self::insert_env_excluded_from_nested_mise_diff(
+                    &mut env,
+                    &mut nested_mise_diff_exclude_keys,
+                    key,
                     value,
                 );
             }

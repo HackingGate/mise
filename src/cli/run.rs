@@ -19,6 +19,7 @@ use crate::task::task_helpers::task_needs_permit;
 use crate::task::task_list::{get_task_lists, resolve_depends};
 use crate::task::task_output::TaskOutput;
 use crate::task::task_output_handler::OutputHandler;
+use crate::task::task_result_file::{TaskIdentity, TaskResult, TaskResultFile, TaskResultState};
 use crate::task::task_scheduler::RunLoopHooks;
 use crate::task::{Deps, Task, TaskCacheMode, usage_command_for_args};
 use crate::toolset::{InstallOptions, ResolveOptions, ToolVersion, ToolsetBuilder};
@@ -389,6 +390,10 @@ pub(crate) struct Run {
     #[usage(skip)]
     pub telemetry: Option<otel::TaskRunTelemetry>,
 
+    /// The run-result file (`task.result_file`), when one is configured.
+    #[usage(skip)]
+    pub result_file: Option<Arc<TaskResultFile>>,
+
     /// Set by launchers that start tasks without a person asking for them.
     #[usage(skip)]
     pub secrets_denied: Option<crate::secrets::SecretsDenied>,
@@ -666,6 +671,24 @@ fn display_affected_text(text: &str) -> String {
 
 impl Run {
     pub(crate) async fn run(mut self) -> Result<()> {
+        // Opened before anything else can fail, so that a run that fails early still
+        // replaces an earlier run's records and ends with its own `end` record.
+        if !self.dry_run {
+            self.result_file = TaskResultFile::open_if_enabled()?.map(Arc::new);
+        }
+        let result_file = self.result_file.clone();
+        let result = self.run_tasks().await;
+        if let Some(result_file) = result_file {
+            let exit_code = match &result {
+                Ok(()) => 0,
+                Err(err) => crate::exit::requested_exit_code(err).unwrap_or(1),
+            };
+            result_file.finish(exit_code);
+        }
+        result
+    }
+
+    async fn run_tasks(mut self) -> Result<()> {
         // Check help flags before doing any work
         if self.task.as_deref() == Some("-h") {
             miseprint!("{}", render_subcommand_help("run", false))?;
@@ -1019,12 +1042,16 @@ impl Run {
         // is idempotent and marks the root span as an error unless the run
         // already succeeded.
         let telemetry = self.telemetry.clone();
+        let result_file = self.result_file.clone();
         let result = if let Some(timeout) = timeout {
             let run = self.parallelize_tasks(config, execution_tasks, previewed_tools);
             tokio::pin!(run);
             match tokio::time::timeout(timeout, run.as_mut()).await {
                 Ok(result) => result,
                 Err(_) => {
+                    if let Some(result_file) = &result_file {
+                        result_file.stop_running_tasks();
+                    }
                     // Dropping the run does not stop the task jobs it spawned,
                     // and their children would outlive mise. It is dropped only
                     // afterwards: that aborts the jobs, whose commands would
@@ -1072,6 +1099,12 @@ impl Run {
         self.setup_executor()?;
         if let (Some(t), Some(executor)) = (&self.telemetry, &mut self.executor) {
             executor.output_forwarder = t.output_forwarder();
+        }
+        if let (Some(result_file), Some(executor)) = (&self.result_file, &mut self.executor) {
+            executor.result_file = Some(result_file.clone());
+            result_file.plan(crate::task::task_result_file::planned_identities(
+                &tasks, &config,
+            ));
         }
 
         // Validate every scheduled invocation before starting the scheduler so
@@ -1272,10 +1305,19 @@ impl Run {
         let semaphore = ctx.semaphore.clone();
         ctx.jset.lock().await.spawn(async move {
             let mut permit = permit_opt;
-            let (completion_state, dependency_state) = {
+            let (completion_state, dependency_state, direct_dependencies) = {
                 let deps = deps_for_remove.lock().await;
-                (deps.completion_state(), deps.dependency_state(&task))
+                (
+                    deps.completion_state(),
+                    deps.dependency_state(&task),
+                    deps.direct_dependencies(&task),
+                )
             };
+            let task_start = std::time::SystemTime::now();
+            if let Some(result_file) = &this.result_file {
+                result_file.start_task(&task);
+            }
+            let cache_decision = std::sync::OnceLock::new();
             // The task's span stays live for as long as the task runs, so its
             // context is available for W3C propagation. Ended below.
             // Args go through the same redactions as terminal output.
@@ -1299,6 +1341,7 @@ impl Run {
                 allow_during_interruption,
                 otel_span_cx,
                 injected,
+                cache_decision: &cache_decision,
             }))
             .catch_unwind()
             .await
@@ -1409,6 +1452,39 @@ impl Run {
             if let (Some(t), Some(span)) = (&this.telemetry, otel_span) {
                 t.end_task(span, &task, &otel_args, otel_end, &result, cancelled);
             }
+            if let Some(result_file) = &this.result_file {
+                let exit_code = match &result {
+                    Err(_) if panicked => Some(1),
+                    Err(err) => Error::get_exit_status(err),
+                    Ok(_) => None,
+                };
+                let task_result = if result
+                    .as_ref()
+                    .is_err_and(Error::is_task_interrupted_before_start)
+                {
+                    TaskResult {
+                        state: TaskResultState::NotRun,
+                        cache: None,
+                        exit_code: None,
+                        start: None,
+                        end: None,
+                    }
+                } else {
+                    TaskResult::finished(
+                        &result,
+                        cache_decision.get().cloned(),
+                        cancelled,
+                        exit_code,
+                        task_start,
+                        otel_end,
+                    )
+                };
+                result_file.record_task(
+                    &task,
+                    &TaskIdentity::new(&task, &direct_dependencies, Some(&ctx.config)),
+                    &task_result,
+                );
+            }
 
             if let Some(oh) = &this.output_handler
                 && oh.output(Some(&task)) == TaskOutput::KeepOrder
@@ -1451,7 +1527,8 @@ impl Run {
         } else {
             self.eprint(&task, &prefix, &format!("{} {err}", style::ered("ERROR")));
         }
-        self.add_failed_task(task.clone(), Error::get_exit_status(&err));
+        let exit_code = Error::get_exit_status(&err);
+        self.add_failed_task(task.clone(), exit_code);
         if !self.continue_on_error {
             #[cfg(unix)]
             crate::cmd::CmdLineRunner::kill_all(nix::sys::signal::SIGTERM);
@@ -1468,6 +1545,20 @@ impl Run {
             t.end_task(span, &task, &args, end_time, &Err(err), false);
         }
         let mut deps = deps_for_remove.lock().await;
+        if let Some(result_file) = &self.result_file {
+            let now = std::time::SystemTime::now();
+            result_file.record_task(
+                &task,
+                &TaskIdentity::new(&task, &deps.direct_dependencies(&task), Some(config)),
+                &TaskResult {
+                    state: TaskResultState::Failed,
+                    cache: None,
+                    exit_code,
+                    start: Some(now),
+                    end: Some(now),
+                },
+            );
+        }
         deps.mark_executed(&task);
         deps.remove(&task);
     }
