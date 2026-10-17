@@ -12,7 +12,7 @@
 use crate::config::Settings;
 use crate::otel::{LogClaim, TaskOutputForwarder, logs_enabled, traces_enabled};
 use crate::task::Task;
-use crate::task::task_executor::TaskRunOutcome;
+use crate::task::task_executor::{TaskRunOutcome, TaskRunState};
 use eyre::Result;
 use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::{
@@ -203,7 +203,7 @@ impl TaskRunTelemetry {
     }
 
     /// End a task's span with attributes and status derived from the result
-    /// (did work / skipped / failed).
+    /// (executed / restored / skipped / failed).
     ///
     /// `cancelled` marks a task that was torn down because a *sibling* task
     /// failed. Its span is still recorded — it did run, and its duration is
@@ -224,8 +224,13 @@ impl TaskRunTelemetry {
         for attr in task_attributes(task, args) {
             span.set_attribute(attr);
         }
+        if let Ok(outcome) = result {
+            for attr in task_cache_attributes(outcome) {
+                span.set_attribute(attr);
+            }
+        }
         match result {
-            Ok(outcome) if outcome.did_work => {
+            Ok(outcome) if outcome.did_work() => {
                 span.set_attribute(KeyValue::new("process.exit.code", 0i64));
                 span.set_status(Status::Ok);
             }
@@ -393,6 +398,30 @@ fn task_attributes(task: &Task, args: &[String]) -> Vec<KeyValue> {
     attrs
 }
 
+/// What a completed task did, and what the artifact cache did for it. A restored
+/// task has the same exit code and status as an executed one, so only these
+/// attributes tell them apart.
+fn task_cache_attributes(outcome: &TaskRunOutcome) -> Vec<KeyValue> {
+    let mut attrs = vec![
+        KeyValue::new(
+            "mise.task.restored",
+            outcome.state == TaskRunState::Restored,
+        ),
+        KeyValue::new("mise.task.cache.enabled", outcome.cache.is_some()),
+    ];
+    match &outcome.cache {
+        Some(cache) => {
+            attrs.push(KeyValue::new("mise.task.cache.key", cache.key.clone()));
+            attrs.push(KeyValue::new(
+                "mise.task.cache.result",
+                cache.result.as_str(),
+            ));
+        }
+        None => attrs.push(KeyValue::new("mise.task.cache.result", "disabled")),
+    }
+    attrs
+}
+
 /// Inject a task span's context into its env vars using the standard
 /// W3C Trace Context propagator and env-carrier variable names.
 pub(crate) fn inject_otel_context(env: &mut BTreeMap<String, String>, span_cx: &SpanContext) {
@@ -429,6 +458,7 @@ fn extract_parent_cx(traceparent: &str, tracestate: Option<&str>) -> Context {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task::task_executor::{TaskCacheDecision, TaskCacheResult};
     use opentelemetry::trace::{SpanId, TraceFlags, TraceId, TraceState};
     use opentelemetry_sdk::error::OTelSdkResult;
     use opentelemetry_sdk::trace::{SimpleSpanProcessor, SpanData, SpanExporter};
@@ -514,8 +544,19 @@ mod tests {
     /// Run one task to completion with the given result and return its span.
     fn ran() -> Result<TaskRunOutcome> {
         Ok(TaskRunOutcome {
-            did_work: true,
+            state: TaskRunState::Executed,
             ..Default::default()
+        })
+    }
+
+    fn cached(state: TaskRunState, result: TaskCacheResult) -> Result<TaskRunOutcome> {
+        Ok(TaskRunOutcome {
+            state,
+            cache_key: Some("k1".to_string()),
+            cache: Some(TaskCacheDecision {
+                key: "k1".to_string(),
+                result,
+            }),
         })
     }
 
@@ -872,6 +913,84 @@ mod tests {
         assert_eq!(span.status, Status::Unset);
         assert_eq!(attr(&span, "mise.task.skipped"), Some(&Value::Bool(true)));
         assert_eq!(attr(&span, "process.exit.code"), Some(&Value::I64(0)));
+    }
+
+    #[test]
+    fn restored_task_span_is_distinct_from_an_executed_one() {
+        let restored = end_one_task(cached(TaskRunState::Restored, TaskCacheResult::Hit), false);
+        let executed = end_one_task(cached(TaskRunState::Executed, TaskCacheResult::Miss), false);
+        for span in [&restored, &executed] {
+            assert_eq!(span.status, Status::Ok);
+            assert_eq!(attr(span, "process.exit.code"), Some(&Value::I64(0)));
+            assert!(attr(span, "mise.task.skipped").is_none());
+            assert_eq!(
+                attr(span, "mise.task.cache.enabled"),
+                Some(&Value::Bool(true))
+            );
+            assert_eq!(attr(span, "mise.task.cache.key"), Some(&Value::from("k1")));
+        }
+        assert_eq!(
+            attr(&restored, "mise.task.restored"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            attr(&restored, "mise.task.cache.result"),
+            Some(&Value::from("hit"))
+        );
+        assert_eq!(
+            attr(&executed, "mise.task.restored"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            attr(&executed, "mise.task.cache.result"),
+            Some(&Value::from("miss"))
+        );
+    }
+
+    #[test]
+    fn fresh_cached_task_span_is_skipped_with_its_key() {
+        let span = end_one_task(cached(TaskRunState::Skipped, TaskCacheResult::Fresh), false);
+        assert_eq!(attr(&span, "mise.task.skipped"), Some(&Value::Bool(true)));
+        assert_eq!(attr(&span, "mise.task.restored"), Some(&Value::Bool(false)));
+        assert_eq!(attr(&span, "mise.task.cache.key"), Some(&Value::from("k1")));
+        assert_eq!(
+            attr(&span, "mise.task.cache.result"),
+            Some(&Value::from("fresh"))
+        );
+    }
+
+    #[test]
+    fn forced_task_span_reports_forced() {
+        let span = end_one_task(
+            cached(TaskRunState::Executed, TaskCacheResult::Forced),
+            false,
+        );
+        assert_eq!(
+            attr(&span, "mise.task.cache.result"),
+            Some(&Value::from("forced"))
+        );
+    }
+
+    #[test]
+    fn uncached_task_span_reports_the_cache_disabled() {
+        let span = end_one_task(ran(), false);
+        assert_eq!(
+            attr(&span, "mise.task.cache.enabled"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            attr(&span, "mise.task.cache.result"),
+            Some(&Value::from("disabled"))
+        );
+        assert!(attr(&span, "mise.task.cache.key").is_none());
+        assert_eq!(attr(&span, "mise.task.restored"), Some(&Value::Bool(false)));
+    }
+
+    #[test]
+    fn failed_task_span_has_no_cache_attributes() {
+        let span = end_one_task(Err(eyre::eyre!("boom")), false);
+        assert!(attr(&span, "mise.task.restored").is_none());
+        assert!(attr(&span, "mise.task.cache.result").is_none());
     }
 
     #[test]
