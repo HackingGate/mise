@@ -29,6 +29,36 @@ pub fn requested_exit_code(err: &Report) -> Option<i32> {
     err.downcast_ref::<ExitRequest>().map(|exit| exit.code)
 }
 
+/// A write to a closed pipe, such as `mise ls | head`: mise exits successfully.
+pub fn is_broken_pipe(err: &Report) -> bool {
+    err.downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe)
+}
+
+/// A read or write interrupted by the user: mise exits with 130.
+pub fn is_interrupted_io_error(err: &Report) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::Interrupted)
+    })
+}
+
+/// The status the process exits with once a command fails with `err`: a
+/// requested status narrowed to a byte as [`status`] narrows it, 0 for a broken
+/// pipe, 130 for an interrupted read or write, and 1 otherwise.
+pub fn exit_code_for(err: &Report) -> i32 {
+    if let Some(code) = requested_exit_code(err) {
+        i32::from(code as u8)
+    } else if is_broken_pipe(err) {
+        0
+    } else if is_interrupted_io_error(err) {
+        130
+    } else {
+        1
+    }
+}
+
 pub fn kill_all() {
     #[cfg(unix)]
     CmdLineRunner::kill_all(SIGTERM);
@@ -63,5 +93,17 @@ mod tests {
     fn finds_requested_exit_code_through_context() {
         let err = request(42).wrap_err("context");
         assert_eq!(requested_exit_code(&err), Some(42));
+    }
+
+    #[test]
+    fn exit_code_for_matches_the_process_status() {
+        assert_eq!(exit_code_for(&request(3).wrap_err("context")), 3);
+        assert_eq!(exit_code_for(&request(256)), 0);
+        assert_eq!(exit_code_for(&request(-1)), 255);
+        let broken_pipe = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        assert_eq!(exit_code_for(&eyre::eyre!(broken_pipe)), 0);
+        let interrupted = std::io::Error::from(std::io::ErrorKind::Interrupted);
+        assert_eq!(exit_code_for(&eyre::eyre!(interrupted).wrap_err("x")), 130);
+        assert_eq!(exit_code_for(&eyre::eyre!("boom")), 1);
     }
 }

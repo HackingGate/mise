@@ -199,12 +199,10 @@ fn handle_err(err: Report) -> eyre::Result<()> {
     if exit::requested_exit_code(&err).is_some() {
         return Err(err);
     }
-    if let Some(err) = err.downcast_ref::<std::io::Error>()
-        && err.kind() == std::io::ErrorKind::BrokenPipe
-    {
+    if exit::is_broken_pipe(&err) {
         return Ok(());
     }
-    if is_interrupted_io_error(&err) {
+    if exit::is_interrupted_io_error(&err) {
         stop_multi_progress();
         return Err(request_exit(130));
     }
@@ -253,14 +251,6 @@ fn display_friendly_err(err: &Report) {
     error!("Version: {}", *VERSION);
     let msg = ui::style::edim("Run with --verbose or MISE_VERBOSE=1 for more information");
     error!("{msg}");
-}
-
-fn is_interrupted_io_error(err: &Report) -> bool {
-    err.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|e| e.kind() == std::io::ErrorKind::Interrupted)
-    })
 }
 
 fn stop_multi_progress() {
@@ -321,12 +311,12 @@ mod tests {
 
     #[test]
     fn detects_interrupted_io_error() {
-        assert!(is_interrupted_io_error(&eyre!(std::io::Error::new(
+        assert!(exit::is_interrupted_io_error(&eyre!(std::io::Error::new(
             std::io::ErrorKind::Interrupted,
             "user cancelled"
         ))));
-        assert!(!is_interrupted_io_error(&eyre!(std::io::Error::other(
-            "user cancelled"
-        ))));
+        assert!(!exit::is_interrupted_io_error(&eyre!(
+            std::io::Error::other("user cancelled")
+        )));
     }
 }

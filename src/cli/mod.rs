@@ -1424,6 +1424,7 @@ impl Cli {
                         executor: None,
                         telemetry: None,
                         task_history: None,
+                        result_file: None,
                         secrets_denied: None,
                         cli_secrets: None,
                         secrets: vec![],
