@@ -178,6 +178,7 @@ export const sidebar: SidebarItem[] = [
       },
       { text: "Project dependencies (experimental)", link: "/dev-tools/deps" },
       { text: "OpenTelemetry (experimental)", link: "/tasks/opentelemetry" },
+      { text: "Run results (experimental)", link: "/tasks/run-results" },
       {
         text: "Task configuration reference",
         link: "/tasks/task-configuration",

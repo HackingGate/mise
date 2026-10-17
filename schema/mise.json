@@ -3385,6 +3385,10 @@
               "description": "Download remote task files and task includes on every run instead of using the cached copy.",
               "type": "boolean"
             },
+            "result_file": {
+              "description": "[experimental] File where `mise run` records what each task did, as versioned JSON Lines.",
+              "type": "string"
+            },
             "run_auto_install": {
               "default": true,
               "description": "Install missing tools automatically before tasks run.",
