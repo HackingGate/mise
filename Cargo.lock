@@ -6924,6 +6924,7 @@ dependencies = [
  "usage-cli",
  "usage-lib",
  "usage-rs",
+ "uuid",
  "versions",
  "vfox",
  "walkdir",
