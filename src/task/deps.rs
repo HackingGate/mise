@@ -461,6 +461,19 @@ impl Deps {
         self.cache_keys.insert(task_key(task), cache_key);
     }
 
+    /// The task's direct `depends` dependencies, sorted.
+    pub fn direct_dependencies(&self, task: &Task) -> Vec<TaskKey> {
+        let mut deps: Vec<TaskKey> = self
+            .dep_edges
+            .get(&task_key(task))
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+        deps.sort();
+        deps
+    }
+
     /// Return the completed dependency state needed for freshness and artifact caching.
     pub fn dependency_state(&self, task: &Task) -> TaskDependencyState {
         let key = task_key(task);
@@ -780,6 +793,24 @@ mod tests {
                 any_did_work: true,
                 any_unkeyed_did_work: false,
             }
+        );
+    }
+
+    #[test]
+    fn direct_dependencies_lists_only_direct_edges() {
+        let a = task("a");
+        let b = task("b");
+        let c = task("c");
+        let dep_edges = HashMap::from([
+            (task_key(&b), HashSet::from([task_key(&a)])),
+            (task_key(&c), HashSet::from([task_key(&b), task_key(&a)])),
+        ]);
+        let deps = deps_with_relationships(dep_edges, HashMap::new());
+        assert_eq!(deps.direct_dependencies(&a), vec![]);
+        assert_eq!(deps.direct_dependencies(&b), vec![task_key(&a)]);
+        assert_eq!(
+            deps.direct_dependencies(&c),
+            vec![task_key(&a), task_key(&b)]
         );
     }
 

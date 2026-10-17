@@ -4268,6 +4268,21 @@ env = "MISE_TASK_REMOTE_NO_CACHE"
 optional = true
 type = "Bool"
 
+[task.result_file]
+description = "[experimental] File where `mise run` records what each task did, as versioned JSON Lines."
+docs = """
+Each top-level `mise run` replaces the file. It writes a `run` record when it
+starts, one `task` record per task (executed, restored, skipped, failed,
+cancelled or not run, with its cache key and exit code), and an `end` record
+with `completed: true` once it has finished, so a file without an `end` record
+comes from a run that was killed. A `mise run` started by a task appends its
+own records to the same file. A relative path resolves against the directory
+mise runs in. See [Run results](/tasks/run-results.html).
+"""
+env = "MISE_TASK_RESULT_FILE"
+optional = true
+type = "Path"
+
 [task.run_auto_install]
 default = true
 description = "Install missing tools automatically before tasks run."
