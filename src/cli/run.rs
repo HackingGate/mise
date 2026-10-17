@@ -1334,7 +1334,7 @@ impl Run {
             // Tasks without sources always run and should not trigger invalidation.
             if let Ok(outcome) = &result {
                 let mut deps = deps_for_remove.lock().await;
-                if outcome.did_work && !task.sources.is_empty() {
+                if outcome.did_work() && !task.sources.is_empty() {
                     deps.mark_did_work(&task);
                 }
                 if let Some(cache_key) = &outcome.cache_key {
