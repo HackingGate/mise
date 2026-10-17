@@ -418,10 +418,81 @@ pub struct TaskExecutor {
     pub output_forwarder: Option<crate::otel::TaskOutputForwarder>,
 }
 
+/// What happened to a task that completed without an error.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TaskRunState {
+    /// Nothing ran: the task was skipped, or its sources and outputs were already current.
+    #[default]
+    Skipped,
+    /// The task's commands ran.
+    Executed,
+    /// The task's outputs and result were restored from the artifact cache instead.
+    Restored,
+}
+
+/// What the artifact cache did for a task in this run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TaskCacheResult {
+    /// The cache was not consulted: the task has no cache, the run turned caching or cache
+    /// reads off, or the task cannot be cached (it receives secrets, or runs raw).
+    #[default]
+    Disabled,
+    /// The outputs in the working tree were already produced under this key; nothing ran.
+    Fresh,
+    /// The outputs were restored from a cache entry.
+    Hit,
+    /// No usable cache entry existed, so the task ran.
+    Miss,
+    /// `--force` ran the task without looking it up.
+    Forced,
+}
+
+impl TaskCacheResult {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Fresh => "fresh",
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+            Self::Forced => "forced",
+        }
+    }
+}
+
+impl From<TaskCacheMissReason> for TaskCacheResult {
+    fn from(reason: TaskCacheMissReason) -> Self {
+        match reason {
+            TaskCacheMissReason::Forced => Self::Forced,
+            TaskCacheMissReason::ReadDisabled => Self::Disabled,
+            TaskCacheMissReason::CorruptEntry
+            | TaskCacheMissReason::DependencyWithoutKey
+            | TaskCacheMissReason::EntryNotFound
+            | TaskCacheMissReason::Expired => Self::Miss,
+        }
+    }
+}
+
+/// The artifact cache key computed for a task in this run, and what the cache did with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCacheDecision {
+    pub key: String,
+    pub result: TaskCacheResult,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TaskRunOutcome {
-    pub did_work: bool,
+    pub state: TaskRunState,
+    /// The stable artifact identity the task produced or reused, passed on to dependents.
     pub cache_key: Option<String>,
+    /// `None` when no cache key was computed for the task.
+    pub cache: Option<TaskCacheDecision>,
+}
+
+impl TaskRunOutcome {
+    /// Whether the task executed or restored outputs, as opposed to being skipped.
+    pub fn did_work(&self) -> bool {
+        self.state != TaskRunState::Skipped
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -723,6 +794,9 @@ impl TaskExecutor {
         // Set for a raw or interactive task that runs with a cache key, so the key can be
         // marked current once the run succeeds.
         let mut raw_cache_state = None;
+        // The key computed for this run and what the cache did with it, reported once the
+        // task ends.
+        let mut cache_decision = None;
         let artifact_cache = if !grant.is_empty()
             && self.task_cache.enabled()
             && task.cache.as_ref().is_some_and(|cache| cache.enabled)
@@ -789,8 +863,12 @@ impl TaskExecutor {
                                 self.eprint(task, &prefix, "sources up-to-date, skipping");
                             }
                             return Ok(TaskRunOutcome {
-                                did_work: false,
+                                state: TaskRunState::Skipped,
                                 cache_key: Some(cache.key().to_string()),
+                                cache: Some(TaskCacheDecision {
+                                    key: cache.key().to_string(),
+                                    result: TaskCacheResult::Fresh,
+                                }),
                             });
                         }
                         // The run may change the outputs and fail before it marks its key, so
@@ -823,11 +901,28 @@ impl TaskExecutor {
                         self.output_handler
                             .replay_cached_output(task, &prefix, &output);
                         return Ok(TaskRunOutcome {
-                            did_work: false,
+                            state: TaskRunState::Skipped,
                             cache_key: Some(cache.key().to_string()),
+                            cache: Some(TaskCacheDecision {
+                                key: cache.key().to_string(),
+                                result: TaskCacheResult::Fresh,
+                            }),
                         });
                     }
                     if bypass_cache {
+                        // A raw run is never looked up, but it is skipped above when its key
+                        // is current, so running it is a miss of that check.
+                        let result = if self.dry_run || !self.task_cache.reads() {
+                            TaskCacheResult::Disabled
+                        } else if self.force {
+                            TaskCacheResult::Forced
+                        } else {
+                            TaskCacheResult::Miss
+                        };
+                        cache_decision = Some(TaskCacheDecision {
+                            key: cache.key().to_string(),
+                            result,
+                        });
                         if raw && !self.dry_run {
                             raw_cache_state = Some(cache);
                         }
@@ -879,8 +974,12 @@ impl TaskExecutor {
                                         );
                                     }
                                     return Ok(TaskRunOutcome {
-                                        did_work: true,
+                                        state: TaskRunState::Restored,
                                         cache_key: Some(cache.key().to_string()),
+                                        cache: Some(TaskCacheDecision {
+                                            key: cache.key().to_string(),
+                                            result: TaskCacheResult::Hit,
+                                        }),
                                     });
                                 }
                                 TaskCacheRestore::Miss(reason) => reason,
@@ -890,6 +989,10 @@ impl TaskExecutor {
                         if !self.quiet(Some(task)) {
                             self.eprint(task, &prefix, &format!("cache miss: {miss_reason}"));
                         }
+                        cache_decision = Some(TaskCacheDecision {
+                            key: cache.key().to_string(),
+                            result: miss_reason.into(),
+                        });
                         Some(cache)
                     }
                 }
@@ -1077,8 +1180,9 @@ impl TaskExecutor {
             raw_cache_key
         };
         Ok(TaskRunOutcome {
-            did_work: true,
+            state: TaskRunState::Executed,
             cache_key,
+            cache: cache_decision,
         })
     }
 
@@ -3280,6 +3384,36 @@ mod tests {
             failed.iter().map(|(_, s)| *s).collect::<Vec<_>>(),
             [Some(2), Some(1)]
         );
+    }
+
+    #[test]
+    fn cache_miss_reasons_map_to_reported_cache_results() {
+        for (reason, result) in [
+            (TaskCacheMissReason::EntryNotFound, "miss"),
+            (TaskCacheMissReason::Expired, "miss"),
+            (TaskCacheMissReason::CorruptEntry, "miss"),
+            (TaskCacheMissReason::DependencyWithoutKey, "miss"),
+            (TaskCacheMissReason::Forced, "forced"),
+            (TaskCacheMissReason::ReadDisabled, "disabled"),
+        ] {
+            let label = reason.to_string();
+            assert_eq!(TaskCacheResult::from(reason).as_str(), result, "{label}");
+        }
+    }
+
+    #[test]
+    fn only_a_skipped_task_did_no_work() {
+        for (state, did_work) in [
+            (TaskRunState::Skipped, false),
+            (TaskRunState::Executed, true),
+            (TaskRunState::Restored, true),
+        ] {
+            let outcome = TaskRunOutcome {
+                state,
+                ..Default::default()
+            };
+            assert_eq!(outcome.did_work(), did_work, "{state:?}");
+        }
     }
 
     #[test]
