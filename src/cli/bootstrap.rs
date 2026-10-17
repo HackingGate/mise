@@ -2813,6 +2813,7 @@ impl Bootstrap {
             context_builder: Default::default(),
             executor: None,
             telemetry: None,
+            result_file: None,
             secrets_denied: Some(crate::secrets::SecretsDenied::Bootstrap),
             cli_secrets: None,
             secrets: vec![],
