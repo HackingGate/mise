@@ -100,18 +100,36 @@ jobs:
           echo "CC_aarch64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
       # Upstream builds on xlarge runners. On the standard arm64 runner the
       # build starved it and it was shut down mid-compile (run 40066490070),
-      # so it gets swap and two compile jobs.
-      - name: Add swap and bound the compile jobs
+      # and again with swap and two compile jobs, 34 minutes after the last
+      # crate started (run 40069114416): the fat-LTO link of mise. It gets
+      # thin LTO, the disk the runner image's unused toolchains hold, swap
+      # and two compile jobs.
+      - name: Free disk, add swap, bound the compile jobs and use thin LTO
         if: matrix.native
         run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
           sudo fallocate -l 8G /swapfile-build
           sudo chmod 600 /swapfile-build
           sudo mkswap /swapfile-build
           sudo swapon /swapfile-build
           free -h
           echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
+          echo "CARGO_PROFILE_SERIOUS_LTO=thin" >> "$GITHUB_ENV"
+      # The native build logs memory and disk every two minutes, so a runner
+      # lost again shows what it ran out of.
       - name: build-tarball ${{ matrix.target }}
-        run: scripts/build-tarball.sh ${{ matrix.target }}
+        env:
+          NATIVE: ${{ matrix.native }}
+        run: |
+          if [[ $NATIVE == true ]]; then
+            while sleep 120; do
+              echo "resources: $(free -m | awk '/Mem:/{print "mem used " $3 "M of " $2 "M"} /Swap:/{print "swap used " $3 "M"}' | paste -sd,), disk free $(df -h --output=avail / | tail -1)"
+            done &
+            trap 'kill $!' EXIT
+          fi
+          scripts/build-tarball.sh ${{ matrix.target }}
       - name: Name the tarball after the fork tag
         env:
           TAG: ${{ inputs.tag }}
