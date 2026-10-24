@@ -6,8 +6,8 @@ name: release-hg
 #
 # release.yml is upstream's and cannot run here: it needs upstream's Namespace
 # runners and signing and publishing secrets. This file builds the two targets
-# the fork's users install, on GitHub's own runner, through upstream's
-# scripts/build-tarball.sh without PGO. It lives in a file of its own so a
+# the fork's users install, each on a GitHub runner of its own architecture,
+# through upstream's scripts/build-tarball.sh without PGO. It lives in a file of its own so a
 # rebase onto upstream never conflicts with it.
 #
 # Cargo.toml keeps upstream's version; the asset names carry the fork tag, as
@@ -54,7 +54,7 @@ jobs:
   build:
     name: build-tarball-${{ matrix.name }}
     needs: source
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
     permissions:
       contents: read
@@ -64,17 +64,40 @@ jobs:
         include:
           - name: linux-x64-musl
             target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          # Native: cross-building it on the amd64 runner lost the runner
+          # after 82 minutes (run 40060940195), where x64 took 38.
           - name: linux-arm64-musl
             target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            native: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.source.outputs.commit }}
           persist-credentials: false
       - name: Install cross
+        if: ${{ !matrix.native }}
         uses: taiki-e/install-action@51cd0b8c0499559d9a4d75c0f5c67bec3a894ec8 # v2.75.28
         with:
           tool: cross
+      # build-tarball.sh runs `cross build` for every Linux target. On the
+      # target's own architecture that is a plain cargo build: a `cross` on
+      # PATH that execs cargo keeps the script unchanged. Debian's musl-tools
+      # ships only `musl-gcc`, which the vendored OpenSSL's cc build needs.
+      - name: Prepare a native musl build
+        if: matrix.native
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add "$TARGET"
+          mkdir -p "$RUNNER_TEMP/native-bin"
+          printf '#!/bin/sh\nexec cargo "$@"\n' > "$RUNNER_TEMP/native-bin/cross"
+          chmod +x "$RUNNER_TEMP/native-bin/cross"
+          echo "$RUNNER_TEMP/native-bin" >> "$GITHUB_PATH"
+          echo "CC_aarch64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
       - name: build-tarball ${{ matrix.target }}
         run: scripts/build-tarball.sh ${{ matrix.target }}
       - name: Name the tarball after the fork tag
