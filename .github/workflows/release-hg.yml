@@ -98,6 +98,18 @@ jobs:
           chmod +x "$RUNNER_TEMP/native-bin/cross"
           echo "$RUNNER_TEMP/native-bin" >> "$GITHUB_PATH"
           echo "CC_aarch64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+      # Upstream builds on xlarge runners. On the standard arm64 runner the
+      # build starved it and it was shut down mid-compile (run 40066490070),
+      # so it gets swap and two compile jobs.
+      - name: Add swap and bound the compile jobs
+        if: matrix.native
+        run: |
+          sudo fallocate -l 8G /swapfile-build
+          sudo chmod 600 /swapfile-build
+          sudo mkswap /swapfile-build
+          sudo swapon /swapfile-build
+          free -h
+          echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
       - name: build-tarball ${{ matrix.target }}
         run: scripts/build-tarball.sh ${{ matrix.target }}
       - name: Name the tarball after the fork tag
