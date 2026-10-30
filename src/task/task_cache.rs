@@ -27,6 +27,14 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
+/// The prefix of the directories a restore stages its archive in and backs the
+/// replaced outputs up to, inside the task's root so that the final renames
+/// stay on one filesystem. Another task's source walk skips them
+/// (`task_source_checker::glob_walk`): while a restore runs they appear,
+/// fill and vanish, and a walk that read one would hash files that are gone
+/// a moment later.
+pub(crate) const STAGING_PREFIX: &str = ".mise-task-cache-";
+
 pub(crate) const CACHE_FORMAT_VERSION: u8 = 2;
 const CACHE_DIR_VERSION: &str = "v2";
 const ARTIFACT_CHECKSUM_FORMAT: u8 = 1;
@@ -612,7 +620,7 @@ impl TaskArtifactCache {
                 .ok_or_else(|| eyre!("task cache archive is missing"))?;
 
             let staging = tempfile::Builder::new()
-                .prefix(".mise-task-cache-")
+                .prefix(STAGING_PREFIX)
                 .tempdir_in(&self.root)?;
             file::untar(
                 archive_path,
@@ -1421,7 +1429,7 @@ fn install_transactionally(
     output_matcher: Option<&Override>,
 ) -> Result<()> {
     let backup = tempfile::Builder::new()
-        .prefix(".mise-task-cache-backup-")
+        .prefix(&format!("{STAGING_PREFIX}backup-"))
         .tempdir_in(root)?;
     let mut backed_up = Vec::new();
     for rel in remove_roots {
