@@ -837,6 +837,10 @@ impl Iterator for GlobWalker {
                 Err(err) => return Some(Err(err)),
             };
             let is_dir = entry.file_type().is_dir();
+            if is_dir && is_task_cache_staging(&entry) {
+                self.walker.skip_current_dir();
+                continue;
+            }
             if is_dir && !self.directory_may_match(&entry) {
                 self.walker.skip_current_dir();
                 continue;
@@ -859,6 +863,18 @@ impl Iterator for GlobWalker {
         }
         None
     }
+}
+
+/// A concurrent restore stages outputs in, and moves replaced ones to,
+/// directories named with [`STAGING_PREFIX`](crate::task::task_cache::STAGING_PREFIX)
+/// inside the task's root. They are never a source or an output, and they
+/// fill and empty during a walk, so every walk skips them.
+fn is_task_cache_staging(entry: &DirEntry) -> bool {
+    entry.depth() > 0
+        && entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(crate::task::task_cache::STAGING_PREFIX))
 }
 
 /// Return a successful walk entry, pruning expected errors from following
@@ -1037,14 +1053,21 @@ impl DirPruner {
         let pruner = self.clone();
         let mut walker = WalkDir::new(dir).follow_links(follow_links).into_iter();
         std::iter::from_fn(move || {
-            let entry = walker.next()?;
-            if let Ok(entry) = &entry
-                && entry.file_type().is_dir()
-                && pruner.excludes_entry(entry)
-            {
-                walker.skip_current_dir();
+            loop {
+                let entry = walker.next()?;
+                if let Ok(dir) = &entry
+                    && dir.file_type().is_dir()
+                {
+                    if is_task_cache_staging(dir) {
+                        walker.skip_current_dir();
+                        continue;
+                    }
+                    if pruner.excludes_entry(dir) {
+                        walker.skip_current_dir();
+                    }
+                }
+                return Some(entry);
             }
-            Some(entry)
         })
     }
 }
@@ -2048,6 +2071,29 @@ fn get_last_modified(root: &Path, patterns_or_paths: &[String]) -> Result<Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glob_walk_skips_task_cache_staging() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let tree = temp.path();
+        let staging = tree.join(format!("{}abc", crate::task::task_cache::STAGING_PREFIX));
+        let backup = tree.join(format!(
+            "{}backup-def",
+            crate::task::task_cache::STAGING_PREFIX
+        ));
+        fs::create_dir_all(staging.join("dist"))?;
+        fs::create_dir_all(&backup)?;
+        fs::create_dir_all(tree.join("src"))?;
+        fs::write(staging.join("dist/out.txt"), "")?;
+        fs::write(backup.join("out.txt"), "")?;
+        fs::write(tree.join("src/in.txt"), "")?;
+
+        let paths = glob_walk(&tree.join("**/*.txt"), false)?
+            .map(|entry| Ok(entry?.into_path()))
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(paths, vec![tree.join("src/in.txt")]);
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]
