@@ -531,7 +531,10 @@ pub(crate) fn glob_walk(pattern: &Path, case_insensitive: bool) -> Result<GlobWa
         glob_pattern.insert(0, '\\');
     }
 
-    let mut builder = GlobWalkerBuilder::new(&base, glob_pattern)
+    // A concurrent restore's staging directories are never a source or an
+    // output: the pattern after the glob prunes them from the walk.
+    let staging = format!("!{}*", crate::task::task_cache::STAGING_PREFIX);
+    let mut builder = GlobWalkerBuilder::from_patterns(&base, &[glob_pattern.as_str(), &staging])
         .follow_links(true)
         .sort_by(|a, b| a.file_name().cmp(b.file_name()))
         .case_insensitive(case_insensitive);
@@ -1529,6 +1532,29 @@ fn get_last_modified(root: &Path, patterns_or_paths: &[String]) -> Result<Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glob_walk_skips_task_cache_staging() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let tree = temp.path();
+        let staging = tree.join(format!("{}abc", crate::task::task_cache::STAGING_PREFIX));
+        let backup = tree.join(format!(
+            "{}backup-def",
+            crate::task::task_cache::STAGING_PREFIX
+        ));
+        fs::create_dir_all(staging.join("dist"))?;
+        fs::create_dir_all(&backup)?;
+        fs::create_dir_all(tree.join("src"))?;
+        fs::write(staging.join("dist/out.txt"), "")?;
+        fs::write(backup.join("out.txt"), "")?;
+        fs::write(tree.join("src/in.txt"), "")?;
+
+        let paths = glob_walk(&tree.join("**/*.txt"), false)?
+            .map(|entry| Ok(entry?.into_path()))
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(paths, vec![tree.join("src/in.txt")]);
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]
