@@ -83,6 +83,26 @@ pub(crate) async fn handle_shim() -> Result<()> {
     if let Some(wrapper) = &wrapper {
         args.splice(1..1, wrapper.args().iter().cloned());
     }
+    // This command's wrapper is already running in this process tree, so the command is one the
+    // wrapper's command started, and the environment it inherited is the one that wrapper ran
+    // with. Run the real command in it as it is: rebuilding it for the toolset of the directory
+    // the command runs in, which need not be the project that started the wrapper (a test's
+    // fixture under a temporary directory), would drop the project's tools from PATH.
+    #[cfg(unix)]
+    if wrapper.is_none() && is_active_command_wrapper(shim_name) {
+        trace!("shim[{bin_name}] ACTIVE WRAPPER, inherited env");
+        let program = args.remove(0);
+        return crate::cli::exec::exec_program(
+            program,
+            args,
+            BTreeMap::new(),
+            Default::default(),
+            &Default::default(),
+            false,
+            &[],
+        )
+        .await;
+    }
     env::set_var("__MISE_SHIM", "1");
     let exec = Exec {
         tool: vec![],
