@@ -1401,10 +1401,20 @@ pub fn make_dir_link(target: &Path, link: &Path) -> Result<()> {
 }
 
 /// Removes a link made by [`make_dir_link`], or an older text-file alias.
+///
+/// A link that is gone by the time it is removed counts as removed: another
+/// mise process rebuilding the same installs dir can unlink it between the
+/// check and the `rm`.
 #[cfg(unix)]
 pub fn remove_dir_link(link: &Path) -> Result<()> {
     if link.is_symlink() || link.is_file() {
-        remove_file(link)?;
+        trace!("rm {}", display_path(link));
+        match fs::remove_file(link) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(e).wrap_err_with(|| format!("failed rm: {}", display_path(link)));
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
