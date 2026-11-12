@@ -738,3 +738,33 @@ fn failed_junction_creation_leaves_no_placeholder_directory() {
     assert!(make_symlink(&target, &link).is_err());
     assert!(link.is_dir());
 }
+
+/// Two mise processes rebuilding one installs dir can both see a stale link
+/// and both remove it. The one that loses the race must not fail on a link
+/// that is already gone.
+#[cfg(unix)]
+#[test]
+fn test_remove_dir_link_tolerates_a_concurrent_removal() {
+    use std::sync::{Arc, Barrier};
+
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("1.0.0")).unwrap();
+    let link = root.path().join("global");
+    let barrier = Arc::new(Barrier::new(2));
+    for _ in 0..500 {
+        make_dir_link(Path::new("./1.0.0"), &link).unwrap();
+        let removers = (0..2)
+            .map(|_| {
+                let (link, barrier) = (link.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    remove_dir_link(&link)
+                })
+            })
+            .collect::<Vec<_>>();
+        for remover in removers {
+            remover.join().unwrap().unwrap();
+        }
+        assert!(fs::symlink_metadata(&link).is_err());
+    }
+}
