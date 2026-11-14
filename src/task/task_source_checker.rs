@@ -9,7 +9,7 @@ use eyre::{Result, bail};
 use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
-use globwalk::{GlobWalker, GlobWalkerBuilder};
+use globwalk::GlobWalkerBuilder;
 use ignore::overrides::{Override, OverrideBuilder};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -466,10 +466,12 @@ pub(crate) fn source_glob_patterns(sources: &[String]) -> Vec<String> {
 ///
 /// `globwalk` recursively searches its base directory, so non-globstar
 /// patterns are capped at their component depth to preserve `glob`'s
-/// component-by-component expansion semantics. Literal prefixes that do not
-/// exist yet are moved into the pattern so they produce zero matches instead
-/// of a traversal error.
-pub(crate) fn glob_walk(pattern: &Path, case_insensitive: bool) -> Result<GlobWalker> {
+/// component-by-component expansion semantics. A pattern whose literal prefix
+/// does not exist matches nothing and walks nothing.
+pub(crate) fn glob_walk(
+    pattern: &Path,
+    case_insensitive: bool,
+) -> Result<impl Iterator<Item = std::result::Result<DirEntry, WalkError>>> {
     fn has_metacharacters(component: &str) -> bool {
         let mut escaped = false;
         for ch in component.chars() {
@@ -513,15 +515,25 @@ pub(crate) fn glob_walk(pattern: &Path, case_insensitive: bool) -> Result<GlobWa
         pattern_depth = 1;
     }
 
-    while !base.as_os_str().is_empty() && !base.exists() {
-        let Some(file_name) = base.file_name().map(|name| name.to_os_string()) else {
-            break;
-        };
-        base.pop();
-        let mut prefixed_pattern = PathBuf::from(file_name);
-        prefixed_pattern.push(glob_pattern);
-        glob_pattern = prefixed_pattern;
-        pattern_depth += 1;
+    // Case-sensitively, the literal prefix is the only directory a match can
+    // be under: when it does not exist the walk yields nothing, rather than
+    // reading the nearest ancestor that does (for `.out/**` with no `.out`,
+    // the whole task root). Case-insensitively, a literal component is still a
+    // pattern (`Src` matches `src`), so the components that do not exist as
+    // spelled move into the pattern and the walk starts above them.
+    if case_insensitive {
+        while !base.as_os_str().is_empty() && !base.try_exists()? {
+            let Some(file_name) = base.file_name().map(|name| name.to_os_string()) else {
+                break;
+            };
+            base.pop();
+            let mut prefixed_pattern = PathBuf::from(file_name);
+            prefixed_pattern.push(glob_pattern);
+            glob_pattern = prefixed_pattern;
+            pattern_depth += 1;
+        }
+    } else if !base.as_os_str().is_empty() && !base.try_exists()? {
+        return Ok(None.into_iter().flatten());
     }
 
     let Some(mut glob_pattern) = pattern_from_path(&glob_pattern) else {
@@ -541,19 +553,36 @@ pub(crate) fn glob_walk(pattern: &Path, case_insensitive: bool) -> Result<GlobWa
     if !recursive {
         builder = builder.max_depth(pattern_depth);
     }
-    Ok(builder.build()?)
+    Ok(Some(builder.build()?).into_iter().flatten())
 }
 
 /// Return a successful walk entry, pruning expected errors from following
-/// symlinks that loop or point to a missing target.
+/// symlinks that loop or point to a missing target, and from entries another
+/// process removed during the walk.
 pub(crate) fn prune_symlink_walk_error(
     entry: std::result::Result<DirEntry, WalkError>,
 ) -> Result<Option<DirEntry>> {
     match entry {
         Ok(entry) => Ok(Some(entry)),
-        Err(err) if symlink_walk_error_path(&err).is_some() => Ok(None),
+        Err(err) if symlink_walk_error_path(&err).is_some() || walk_entry_removed(&err) => Ok(None),
         Err(err) => Err(err.into()),
     }
+}
+
+/// Whether a walk error reports an entry that is no longer there: the walk
+/// listed it, and another process removed it, or a directory above it, before
+/// the walk read it. Such an entry was not there to match, so callers treat it
+/// as absent. A symlink whose target is missing still exists and is not one
+/// (see [`symlink_walk_error_path`]); any other error, such as a permission
+/// error, is not one either.
+pub(crate) fn walk_entry_removed(err: &WalkError) -> bool {
+    let Some(path) = err.path() else {
+        return false;
+    };
+    err.io_error()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        && fs::symlink_metadata(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Return the symlink path attached to an expected loop or missing-target
@@ -1652,6 +1681,48 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()?;
 
         assert_eq!(paths, [tree.join("a.txt"), tree.join("b.txt")]);
+        Ok(())
+    }
+
+    /// The walk of a pattern whose literal prefix is missing must not read the
+    /// directory above it: a dangling symlink there is an error entry to any
+    /// walk that reaches it.
+    #[cfg(unix)]
+    #[test]
+    fn glob_walk_does_not_walk_above_a_missing_literal_prefix() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        symlink("missing-target", temp.path().join("dangling"))?;
+        fs::create_dir(temp.path().join("present"))?;
+        fs::write(temp.path().join("present/out.txt"), "")?;
+
+        for pattern in [".test-evidence/check-rust/**", ".test-evidence/*.txt"] {
+            let entries = glob_walk(&temp.path().join(pattern), false)?
+                .map(|entry| entry.map(|entry| entry.into_path()))
+                .collect_vec();
+            assert!(entries.is_empty(), "{pattern}: {entries:?}");
+        }
+        Ok(())
+    }
+
+    /// An entry another process removed between the walk listing it and
+    /// reading it is absent, not an error; other walk errors stay errors.
+    #[test]
+    fn prune_symlink_walk_error_treats_a_removed_entry_as_absent() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let removed = WalkDir::new(temp.path().join("removed"))
+            .into_iter()
+            .next()
+            .expect("a walk of a missing root yields its error");
+        assert!(prune_symlink_walk_error(removed)?.is_none());
+
+        fs::write(temp.path().join("file"), "")?;
+        let not_a_directory = WalkDir::new(temp.path().join("file/child"))
+            .into_iter()
+            .next()
+            .expect("a walk below a file yields its error");
+        assert!(prune_symlink_walk_error(not_a_directory).is_err());
         Ok(())
     }
 

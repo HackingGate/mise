@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+
+# An output glob whose literal prefix does not exist matches nothing, and the
+# walk that finds so reads nothing above that prefix. It used to walk the
+# nearest directory that existed, here the task root, and failed on whatever it
+# met there: another process's directory as it was removed, or one it cannot
+# read, which stands in for that race because it fails the same walk every
+# time. Root reads every directory, so the check needs another user.
+
+cat <<'EOF_TOML' >mise.toml
+[settings]
+experimental = true
+
+[tasks.t]
+run = "true"
+sources = ["in.txt"]
+outputs = [".test-evidence/check-rust/**"]
+cache = { enabled = true }
+EOF_TOML
+
+printf 'in\n' >in.txt
+
+if [ "$(id -u)" != 0 ]; then
+  mkdir -p unreadable/inner
+  chmod 000 unreadable
+  assert_succeed "mise run --dry-run --task-cache-explain-json t"
+  chmod 755 unreadable
+fi
