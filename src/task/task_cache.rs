@@ -10,7 +10,7 @@ use crate::task::task_cache_store::{
 use crate::task::task_source_checker::{
     DirPruner, TaskCacheInputs, build_output_matcher, expand_enumeration_patterns,
     glob_has_entries, glob_walk_pruned, is_output, output_glob_patterns, symlink_walk_error_path,
-    task_cache_inputs, task_cwd, task_source_paths,
+    task_cache_inputs, task_cwd, task_source_paths, walk_entry_removed,
 };
 use crate::task::{RunEntry, Task};
 use crate::toolset::Toolset;
@@ -1462,17 +1462,23 @@ fn resolve_output_roots(task: &Task, root: &Path, require_matches: bool) -> Resu
                 let full = root.join(expanded);
                 let mut walker = glob_walk_pruned(&full, false, &pruner)?;
                 for entry in walker.by_ref() {
-                    let path = match entry {
-                        Ok(entry) => entry.into_path(),
+                    // The type comes from the walk, not a second stat that an
+                    // entry removed since would fail. A symlink is an output
+                    // root of its own and never a directory one.
+                    let (path, is_dir) = match entry {
+                        Ok(entry) => {
+                            let is_dir = !entry.path_is_symlink() && entry.file_type().is_dir();
+                            (entry.into_path(), is_dir)
+                        }
                         Err(err) => match symlink_walk_error_path(&err) {
-                            Some(path) => path.to_path_buf(),
+                            Some(path) => (path.to_path_buf(), false),
+                            None if walk_entry_removed(&err) => continue,
                             None => return Err(err.into()),
                         },
                     };
                     glob_matched = true;
                     let rel = path.strip_prefix(root)?.to_path_buf();
                     ensure_safe_relative(&rel)?;
-                    let is_dir = fs::symlink_metadata(&path)?.is_dir();
                     if is_output(&matcher, &path, is_dir) {
                         resolved.insert(rel);
                     }
