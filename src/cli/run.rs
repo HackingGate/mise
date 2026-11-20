@@ -2410,7 +2410,9 @@ fn history_status(
 ) -> (crate::task::task_history::RunStatus, Option<i32>) {
     use crate::task::task_history::RunStatus;
     match result {
-        Ok(outcome) if outcome.state == crate::task::task_executor::TaskRunState::Restored => (RunStatus::Cached, None),
+        Ok(outcome) if outcome.state == crate::task::task_executor::TaskRunState::Restored => {
+            (RunStatus::Cached, None)
+        }
         Ok(outcome) if outcome.did_work() => (RunStatus::Ok, Some(0)),
         Ok(_) => (RunStatus::Skipped, None),
         Err(_) if panicked => (RunStatus::Failed, Some(1)),
@@ -2426,7 +2428,9 @@ fn report_status(
     cancelled: bool,
 ) -> (TaskReportStatus, Option<i32>) {
     match result {
-        Ok(outcome) if outcome.state == crate::task::task_executor::TaskRunState::Restored => (TaskReportStatus::Cached, None),
+        Ok(outcome) if outcome.state == crate::task::task_executor::TaskRunState::Restored => {
+            (TaskReportStatus::Cached, None)
+        }
         Ok(outcome) if !outcome.did_work() => (TaskReportStatus::Skipped, None),
         Ok(_) => (TaskReportStatus::Passed, Some(0)),
         // Abandoned before it started: the run never reached it.
